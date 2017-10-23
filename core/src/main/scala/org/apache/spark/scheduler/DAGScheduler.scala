@@ -23,15 +23,12 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.annotation.tailrec
-import scala.collection.Map
-import scala.collection.mutable.{ArrayStack, HashMap, HashSet}
+import scala.collection.{Map, mutable}
+import scala.collection.mutable.{ArrayStack, HashMap, HashSet, Queue}
 import scala.concurrent.duration._
 import scala.language.existentials
 import scala.language.postfixOps
 import scala.util.control.NonFatal
-
-import org.apache.commons.lang3.SerializationUtils
-
 import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.executor.TaskMetrics
@@ -153,6 +150,10 @@ class DAGScheduler(
 
   // Stages we need to run whose parents aren't done
   private[scheduler] val waitingStages = new HashSet[Stage]
+
+  // Stages ready to run but waiting because of the sequential constraint
+  private[scheduler] val readyStages = new Queue[Stage]
+
 
   // Stages we are running right now
   private[scheduler] val runningStages = new HashSet[Stage]
@@ -778,15 +779,23 @@ class DAGScheduler(
    * successfully.
    */
   private def submitWaitingChildStages(parent: Stage) {
+
     logTrace(s"Checking if any dependencies of $parent are now runnable")
     logTrace("running: " + runningStages)
     logTrace("waiting: " + waitingStages)
     logTrace("failed: " + failedStages)
     val childStages = waitingStages.filter(_.parents.contains(parent)).toArray
     waitingStages --= childStages
+
     for (stage <- childStages.sortBy(_.firstJobId)) {
       submitStage(stage)
     }
+  }
+
+
+  private def submitReadyStages(): Unit = {
+      if (!readyStages.isEmpty)
+        submitStage(readyStages.dequeue())
   }
 
   /** Finds the earliest-created active job that needs the stage */
@@ -942,9 +951,16 @@ class DAGScheduler(
         val missing = getMissingParentStages(stage).sortBy(_.id)
         logDebug("missing: " + missing)
         if (missing.isEmpty) {
-          logInfo("Submitting " + stage + " (" + stage.rdd + "), which has no missing parents")
-          submitMissingTasks(stage, jobId.get)
-        } else {
+
+          if (waitingStages.isEmpty) {
+            logInfo("Submitting " + stage + " (" + stage.rdd + "), which has no missing parents")
+            submitMissingTasks(stage, jobId.get)
+          }
+          else if (!readyStages.contains(stage)){
+            readyStages += stage
+          }
+        }
+        else {
           for (parent <- missing) {
             submitStage(parent)
           }
@@ -1092,7 +1108,7 @@ class DAGScheduler(
           s"Stage ${stage} is actually done; (partitions: ${stage.numPartitions})"
       }
       logDebug(debugString)
-
+      submitReadyStages()
       submitWaitingChildStages(stage)
     }
   }
@@ -1296,6 +1312,7 @@ class DAGScheduler(
                     markMapStageJobAsFinished(job, stats)
                   }
                 }
+                submitReadyStages()
                 submitWaitingChildStages(shuffleStage)
               }
             }
